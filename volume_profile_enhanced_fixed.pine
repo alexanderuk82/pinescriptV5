@@ -1,0 +1,677 @@
+//@version=5
+indicator("Advanced Volume Profile Strategy - Trader Dale Method", "VP_DALE", overlay=true, max_bars_back=5000, max_lines_count=100, max_boxes_count=50)
+
+// ==================== INPUT PARAMETERS ====================
+// Volume Profile Settings
+vp_resolution = input.int(50, "Volume Profile Bins", minval=10, maxval=200, group="Volume Profile")
+value_area_pct = input.float(70.0, "Value Area %", minval=50.0, maxval=95.0, step=5.0, group="Volume Profile")
+lookback_periods = input.int(50, "Lookback Periods for Analysis", minval=20, maxval=200, group="Volume Profile")
+
+// Trader Dale Setup Settings
+enable_accumulation_setup = input.bool(true, "Setup #1: Volume Accumulation", group="Trader Dale Setups")
+enable_trend_setup = input.bool(true, "Setup #2: Trend Volume Setup", group="Trader Dale Setups") 
+enable_rejection_setup = input.bool(true, "Setup #3: Rejection Setup", group="Trader Dale Setups")
+enable_reversal_setup = input.bool(true, "Reversal Trades", group="Trader Dale Setups")
+
+// Price Action Confirmations (From PDF)
+enable_support_resistance = input.bool(true, "Support/Resistance Confirmation", group="Price Action Confirmations")
+enable_open_drive = input.bool(true, "Open-Drive Detection", group="Price Action Confirmations")
+enable_session_levels = input.bool(true, "Session Open Levels", group="Price Action Confirmations")
+enable_daily_levels = input.bool(true, "Daily/Weekly H&L", group="Price Action Confirmations")
+
+// Context Analysis
+min_confirmations = input.int(2, "Minimum Confirmations Required", minval=1, maxval=4, group="Entry Requirements")
+avoid_counter_trend = input.bool(true, "Avoid Counter-Trend Trades", group="Entry Requirements")
+strong_trend_ema_period = input.int(50, "Strong Trend EMA Period", minval=20, maxval=200, group="Entry Requirements")
+
+// Risk Management (From PDF - 10/12 pip standard)
+risk_reward_ratio = input.float(1.0, "Risk:Reward Ratio", minval=0.5, maxval=3.0, step=0.1, group="Risk Management")
+atr_multiplier_sl = input.float(1.2, "ATR Multiplier for SL", minval=0.5, maxval=3.0, group="Risk Management")
+atr_multiplier_tp = input.float(1.0, "ATR Multiplier for TP", minval=0.5, maxval=3.0, group="Risk Management")
+sl_management = input.string("Neutral", "SL Management Style", options=["Aggressive", "Neutral", "Conservative"], group="Risk Management")
+
+// Visual Settings
+show_volume_profile = input.bool(true, "Show Volume Profile", group="Visual")
+show_price_action = input.bool(true, "Show Price Action Areas", group="Visual")
+show_trade_setups = input.bool(true, "Show Trade Setup Details", group="Visual")
+show_context_analysis = input.bool(true, "Show Context Analysis", group="Visual")
+
+// Colors
+poc_color = input.color(color.red, "POC Color", group="Colors")
+value_area_color = input.color(color.new(color.yellow, 90), "Value Area", group="Colors")
+accumulation_color = input.color(color.new(color.green, 80), "Accumulation Zone", group="Colors")
+rejection_color = input.color(color.new(color.orange, 80), "Rejection Zone", group="Colors")
+trend_color = input.color(color.new(#0000ff, 80), "Trend Zone", group="Colors")
+
+// ==================== TYPE DEFINITIONS ====================
+type VolumeNode
+    float price
+    float volume
+    float cum_volume
+
+type VolumeProfile
+    array<VolumeNode> nodes
+    float poc_price
+    float poc_volume
+    float vah_price
+    float val_price
+    float total_volume
+    int start_bar
+    int end_bar
+
+type PriceActionZone
+    float high_price
+    float low_price
+    int start_bar
+    int end_bar
+    string zone_type
+    float strength
+
+type TradeSetup
+    string setup_type
+    string direction
+    float entry_price
+    float stop_loss
+    float take_profit
+    array<string> confirmations
+    float strength_score
+    int signal_bar
+
+type MarketContext
+    string market_phase
+    float trend_strength  
+    bool in_strong_trend
+
+// ==================== GLOBAL VARIABLES ====================
+var array<PriceActionZone> price_action_zones = array.new<PriceActionZone>()
+var array<VolumeProfile> volume_profiles = array.new<VolumeProfile>()
+var array<TradeSetup> active_setups = array.new<TradeSetup>()
+
+// Position tracking
+var bool position_active = false
+var string position_type = ""
+var float entry_price = na
+var float stop_loss = na
+var float take_profit = na
+var string current_setup_type = ""
+
+// ==================== HELPER FUNCTIONS ====================
+// ATR for dynamic sizing
+atr14 = ta.atr(14)
+
+// EMA for trend analysis
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+ema_trend = ta.ema(close, strong_trend_ema_period)
+
+// Higher timeframe trend analysis - FIXED: Returns MarketContext instead of modifying globals
+analyze_market_context() =>
+    ema_slope = (ema_trend - ema_trend[5]) / ema_trend[5] * 100
+    trend_strength_calc = math.abs(ema_slope)
+    
+    strong_up = ema20 > ema50 and ema50 > ema_trend and ema_slope > 0.1
+    strong_down = ema20 < ema50 and ema50 < ema_trend and ema_slope < -0.1
+    
+    in_strong_trend_calc = strong_up or strong_down
+    
+    market_phase_calc = if strong_up
+        "Trending_Up"
+    else if strong_down
+        "Trending_Down"
+    else
+        ema_slope > 0 ? "Accumulation" : "Distribution"
+    
+    MarketContext.new(market_phase_calc, trend_strength_calc, in_strong_trend_calc)
+
+// Get current market context
+current_context = analyze_market_context()
+
+// ==================== VOLUME PROFILE CALCULATION ====================
+calculate_flexible_volume_profile(start_bar, end_bar) =>
+    if start_bar >= end_bar or end_bar - start_bar < 3
+        VolumeProfile.new(array.new<VolumeNode>(), float(na), 0.0, float(na), float(na), 0.0, start_bar, end_bar)
+    else
+        // Get price range for the period
+        highest_price = high[start_bar]
+        lowest_price = low[start_bar]
+        
+        for i = start_bar to end_bar
+            if i < bar_index and not na(high[i])
+                highest_price := math.max(highest_price, high[i])
+                lowest_price := math.min(lowest_price, low[i])
+        
+        price_range = highest_price - lowest_price
+        if price_range <= 0
+            VolumeProfile.new(array.new<VolumeNode>(), float(na), 0.0, float(na), float(na), 0.0, start_bar, end_bar)
+        else
+            bin_size = price_range / vp_resolution
+            volume_bins = array.new<float>(vp_resolution, 0.0)
+            
+            // Distribute volume across price levels
+            for i = start_bar to end_bar
+                if i < bar_index and not na(volume[i]) and not na(high[i]) and not na(low[i])
+                    candle_range = high[i] - low[i]
+                    vol_per_tick = candle_range > 0 ? volume[i] / (candle_range + 1) : volume[i]
+                    
+                    // Distribute volume across the candle range
+                    start_bin = math.floor((low[i] - lowest_price) / bin_size)
+                    end_bin = math.floor((high[i] - lowest_price) / bin_size)
+                    
+                    start_bin := math.max(0, math.min(vp_resolution - 1, start_bin))
+                    end_bin := math.max(0, math.min(vp_resolution - 1, end_bin))
+                    
+                    for bin = start_bin to end_bin
+                        if bin >= 0 and bin < vp_resolution
+                            current_vol = array.get(volume_bins, bin)
+                            array.set(volume_bins, bin, current_vol + vol_per_tick)
+            
+            // Create nodes and find POC
+            nodes = array.new<VolumeNode>()
+            total_vol = 0.0
+            max_volume = 0.0
+            float poc_price_calc = na  // FIXED: Explicit type declaration
+            
+            for i = 0 to vp_resolution - 1
+                vol = array.get(volume_bins, i)
+                price = lowest_price + i * bin_size + bin_size / 2
+                
+                if vol > 0
+                    array.push(nodes, VolumeNode.new(price, vol, 0.0))
+                    total_vol += vol
+                    
+                    if vol > max_volume
+                        max_volume := vol
+                        poc_price_calc := price
+            
+            // Calculate Value Area
+            float vah_price_calc = na  // FIXED: Explicit type declaration
+            float val_price_calc = na  // FIXED: Explicit type declaration
+            
+            if array.size(nodes) > 1
+                // Sort by volume descending for value area calculation
+                for i = 0 to array.size(nodes) - 2
+                    for j = i + 1 to array.size(nodes) - 1
+                        node_i = array.get(nodes, i)
+                        node_j = array.get(nodes, j)
+                        if node_j.volume > node_i.volume
+                            array.set(nodes, i, node_j)
+                            array.set(nodes, j, node_i)
+                
+                // Find value area (70% of volume)
+                target_volume = total_vol * value_area_pct / 100
+                accumulated_volume = 0.0
+                
+                for i = 0 to array.size(nodes) - 1
+                    if accumulated_volume < target_volume
+                        node = array.get(nodes, i)
+                        accumulated_volume += node.volume
+                        
+                        if na(vah_price_calc) or node.price > vah_price_calc
+                            vah_price_calc := node.price
+                        if na(val_price_calc) or node.price < val_price_calc
+                            val_price_calc := node.price
+            
+            VolumeProfile.new(nodes, poc_price_calc, max_volume, vah_price_calc, val_price_calc, total_vol, start_bar, end_bar)
+
+// ==================== PRICE ACTION ANALYSIS (From PDF) ====================
+// Detect sideways price action areas (institutional accumulation)
+detect_sideways_areas() =>
+    sideways_zones = array.new<PriceActionZone>()
+    
+    // Look for consolidation periods
+    for lookback = 10 to 50
+        if lookback < bar_index
+            period_high = ta.highest(high, lookback)[lookback]
+            period_low = ta.lowest(low, lookback)[lookback]
+            price_range = period_high - period_low
+            avg_range = ta.atr(14)[lookback] * lookback * 0.3
+            
+            // If price range is small relative to expected movement it's sideways
+            if price_range < avg_range and price_range > 0
+                // Calculate consolidation strength
+                touches_high = 0
+                touches_low = 0
+                
+                for i = 0 to lookback - 1
+                    if i < bar_index
+                        if math.abs(high[i] - period_high) < price_range * 0.1
+                            touches_high += 1
+                        if math.abs(low[i] - period_low) < price_range * 0.1
+                            touches_low += 1
+                
+                // Strong sideways if multiple touches
+                if touches_high >= 2 and touches_low >= 2
+                    strength = math.min(1.0, (touches_high + touches_low) / 8.0)
+                    zone = PriceActionZone.new(period_high, period_low, lookback, 0, "sideways", strength)
+                    array.push(sideways_zones, zone)
+    
+    sideways_zones
+
+// Detect aggressive initiation activity (breakouts from accumulation)
+detect_aggressive_initiation() =>
+    initiation_zones = array.new<PriceActionZone>()
+    
+    // Look for strong moves following consolidation
+    for i = 1 to 20
+        if i < bar_index
+            current_range = high[i] - low[i]
+            avg_range = ta.atr(14)[i]
+            
+            // Aggressive move if range is much larger than average
+            if current_range > avg_range * 2
+                volume_spike = na(volume[i]) ? false : volume[i] > ta.sma(volume, 20)[i] * 1.5
+                
+                if volume_spike or current_range > avg_range * 3
+                    direction = close[i] > open[i] ? "aggressive_up" : "aggressive_down"
+                    strength = math.min(1.0, current_range / (avg_range * 4))
+                    
+                    zone = PriceActionZone.new(high[i], low[i], i, i, direction, strength)
+                    array.push(initiation_zones, zone)
+    
+    initiation_zones
+
+// Detect strong rejections (Pin bars, strong reversals)
+detect_strong_rejections() =>
+    rejection_zones = array.new<PriceActionZone>()
+    
+    for i = 1 to 30
+        if i < bar_index
+            body_size = math.abs(close[i] - open[i])
+            candle_size = high[i] - low[i]
+            upper_wick = high[i] - math.max(close[i], open[i])
+            lower_wick = math.min(close[i], open[i]) - low[i]
+            
+            // Strong rejection criteria
+            strong_upper_rejection = upper_wick > body_size * 2 and upper_wick > candle_size * 0.6
+            strong_lower_rejection = lower_wick > body_size * 2 and lower_wick > candle_size * 0.6
+            
+            if strong_upper_rejection
+                strength = math.min(1.0, upper_wick / (candle_size + 0.0001))
+                zone = PriceActionZone.new(high[i], high[i] - upper_wick * 0.5, i, i, "rejection_down", strength)
+                array.push(rejection_zones, zone)
+            
+            if strong_lower_rejection
+                strength = math.min(1.0, lower_wick / (candle_size + 0.0001))
+                zone = PriceActionZone.new(low[i] + lower_wick * 0.5, low[i], i, i, "rejection_up", strength)
+                array.push(rejection_zones, zone)
+    
+    rejection_zones
+
+// ==================== TRADER DALE SETUP DETECTION ====================
+// Setup #1: Volume Accumulation Setup
+detect_volume_accumulation_setup() =>
+    setups = array.new<TradeSetup>()
+    
+    // Find recent sideways areas
+    sideways_areas = detect_sideways_areas()
+    
+    if array.size(sideways_areas) > 0
+        for i = 0 to array.size(sideways_areas) - 1
+            zone = array.get(sideways_areas, i)
+            
+            // Check if there was a breakout from this zone
+            breakout_up = high[0] > zone.high_price or high[1] > zone.high_price
+            breakout_down = low[0] < zone.low_price or low[1] < zone.low_price
+            
+            if breakout_up or breakout_down
+                // Calculate volume profile for the sideways zone
+                vp = calculate_flexible_volume_profile(zone.start_bar, zone.end_bar)
+                
+                if not na(vp.poc_price)
+                    // Price should return to POC for entry
+                    price_near_poc = math.abs(close - vp.poc_price) <= atr14 * 0.5
+                    
+                    if price_near_poc
+                        direction = breakout_up ? "long" : "short"
+                        
+                        // Calculate entry details
+                        entry = vp.poc_price
+                        stop = direction == "long" ? vp.val_price - atr14 * atr_multiplier_sl : vp.vah_price + atr14 * atr_multiplier_sl
+                        target = direction == "long" ? vp.vah_price + atr14 * atr_multiplier_tp : vp.val_price - atr14 * atr_multiplier_tp
+                        
+                        confirmations = array.new<string>()
+                        array.push(confirmations, "Volume Accumulation")
+                        array.push(confirmations, "POC Test")
+                        
+                        strength = zone.strength * 0.8 + 0.2
+                        
+                        setup = TradeSetup.new("Volume Accumulation", direction, entry, stop, target, confirmations, strength, bar_index)
+                        array.push(setups, setup)
+    
+    setups
+
+// Setup #2: Trend Setup  
+detect_trend_setup() =>
+    setups = array.new<TradeSetup>()
+    
+    // Only in trending markets
+    if current_context.in_strong_trend
+        // Look for volume clusters within trends
+        for lookback = 5 to 20
+            if lookback < bar_index
+                // Check if this was a pause in trend with volume accumulation
+                period_high = ta.highest(high, lookback)[lookback]
+                period_low = ta.lowest(low, lookback)[lookback]
+                
+                // Calculate volume profile for this cluster
+                vp = calculate_flexible_volume_profile(lookback, 0)
+                
+                if not na(vp.poc_price)
+                    // Price should be testing back to the volume cluster
+                    price_near_poc = math.abs(close - vp.poc_price) <= atr14 * 0.3
+                    
+                    // Ensure we're trading in direction of trend  
+                    trend_up = current_context.market_phase == "Trending_Up"
+                    trend_down = current_context.market_phase == "Trending_Down"
+                    
+                    if price_near_poc and (trend_up or trend_down)
+                        direction = trend_up ? "long" : "short"
+                        
+                        entry = vp.poc_price
+                        stop = direction == "long" ? period_low - atr14 * atr_multiplier_sl : period_high + atr14 * atr_multiplier_sl
+                        target = direction == "long" ? period_high + atr14 * atr_multiplier_tp : period_low - atr14 * atr_multiplier_tp
+                        
+                        confirmations = array.new<string>()
+                        array.push(confirmations, "Trend Volume Cluster")
+                        array.push(confirmations, "Strong Trend Context")
+                        
+                        strength = current_context.trend_strength / 100 + 0.3
+                        
+                        setup = TradeSetup.new("Trend Volume", direction, entry, stop, target, confirmations, strength, bar_index)
+                        array.push(setups, setup)
+    
+    setups
+
+// Setup #3: Rejection Setup
+detect_rejection_setup() =>
+    setups = array.new<TradeSetup>()
+    
+    rejection_areas = detect_strong_rejections()
+    
+    if array.size(rejection_areas) > 0
+        for i = 0 to array.size(rejection_areas) - 1
+            zone = array.get(rejection_areas, i)
+            
+            // Calculate volume profile within the rejection
+            vp = calculate_flexible_volume_profile(zone.start_bar, zone.end_bar)
+            
+            if not na(vp.poc_price)
+                // Price should return to the rejection area
+                in_rejection_zone = close >= zone.low_price and close <= zone.high_price
+                approaching_zone = math.abs(close - vp.poc_price) <= atr14 * 0.4
+                
+                if in_rejection_zone or approaching_zone
+                    direction = zone.zone_type == "rejection_up" ? "long" : "short"
+                    
+                    entry = vp.poc_price
+                    stop = direction == "long" ? zone.low_price - atr14 * atr_multiplier_sl : zone.high_price + atr14 * atr_multiplier_sl
+                    target = direction == "long" ? zone.high_price + atr14 * atr_multiplier_tp : zone.low_price - atr14 * atr_multiplier_tp
+                    
+                    confirmations = array.new<string>()
+                    array.push(confirmations, "Strong Rejection")
+                    array.push(confirmations, "Volume Distribution")
+                    
+                    strength = zone.strength
+                    
+                    setup = TradeSetup.new("Rejection", direction, entry, stop, target, confirmations, strength, bar_index)
+                    array.push(setups, setup)
+    
+    setups
+
+// ==================== PRICE ACTION CONFIRMATIONS ====================
+// Support becoming resistance confirmation
+get_support_resistance_confirmation(setup_price, direction) =>
+    confirmation_found = false
+    
+    // Look for previous significant levels
+    for i = 10 to 100
+        if i < bar_index
+            prev_high = high[i]
+            prev_low = low[i]
+            
+            // Check if current setup price aligns with previous support/resistance
+            near_prev_high = math.abs(setup_price - prev_high) <= atr14 * 0.2
+            near_prev_low = math.abs(setup_price - prev_low) <= atr14 * 0.2
+            
+            if direction == "long" and near_prev_high
+                confirmation_found := true
+                break
+            else if direction == "short" and near_prev_low
+                confirmation_found := true
+                break
+    
+    confirmation_found
+
+// Session open confirmation
+get_session_open_confirmation(setup_price) =>
+    // Daily open (NY close at 5 PM = start of new day)
+    daily_open = request.security(syminfo.tickerid, "1D", open)
+    near_daily_open = math.abs(setup_price - daily_open) <= atr14 * 0.3
+    near_daily_open
+
+// ==================== MAIN STRATEGY LOGIC ====================
+// Clear old setups
+if array.size(active_setups) > 10
+    array.clear(active_setups)
+
+// Get all potential setups
+accumulation_setups = enable_accumulation_setup ? detect_volume_accumulation_setup() : array.new<TradeSetup>()
+trend_setups = enable_trend_setup ? detect_trend_setup() : array.new<TradeSetup>()
+rejection_setups = enable_rejection_setup ? detect_rejection_setup() : array.new<TradeSetup>()
+
+// Combine all setups
+all_setups = array.new<TradeSetup>()
+array.concat(all_setups, accumulation_setups)
+array.concat(all_setups, trend_setups)
+array.concat(all_setups, rejection_setups)
+
+// Enhance setups with confirmations
+best_setup = TradeSetup.new("", "", na, na, na, array.new<string>(), 0.0, 0)
+highest_score = 0.0
+
+if array.size(all_setups) > 0
+    for i = 0 to array.size(all_setups) - 1
+        setup = array.get(all_setups, i)
+        score = setup.strength_score
+        
+        // Add confirmation bonuses
+        if enable_support_resistance and get_support_resistance_confirmation(setup.entry_price, setup.direction)
+            array.push(setup.confirmations, "Support/Resistance")
+            score += 0.3
+        
+        if enable_session_levels and get_session_open_confirmation(setup.entry_price)
+            array.push(setup.confirmations, "Session Level")
+            score += 0.2
+        
+        // Avoid counter-trend trades if enabled
+        if avoid_counter_trend and current_context.in_strong_trend
+            trend_up = current_context.market_phase == "Trending_Up"
+            if (trend_up and setup.direction == "short") or (not trend_up and setup.direction == "long")
+                score -= 0.5
+        
+        // Update score
+        setup.strength_score := score
+        
+        // Check if this is the best setup
+        if score > highest_score and array.size(setup.confirmations) >= min_confirmations
+            highest_score := score
+            best_setup := setup
+
+// Signal generation
+var string signal_state = "Waiting"
+new_signal = false
+
+if not position_active and highest_score > 0.5
+    // Price near entry condition
+    price_distance = math.abs(close - best_setup.entry_price)
+    entry_threshold = atr14 * 0.2
+    
+    if price_distance <= entry_threshold
+        signal_state := best_setup.direction == "long" ? "Buy" : "Sell"
+        current_setup_type := best_setup.setup_type
+        entry_price := best_setup.entry_price
+        stop_loss := best_setup.stop_loss
+        take_profit := best_setup.take_profit
+        position_active := true
+        position_type := best_setup.direction
+        new_signal := true
+        
+        // Store setup
+        array.push(active_setups, best_setup)
+
+// Position management
+if position_active
+    // Exit conditions
+    if (position_type == "long" and close <= stop_loss) or (position_type == "short" and close >= stop_loss)
+        signal_state := "Stop Loss"
+        position_active := false
+        position_type := ""
+        
+    else if (position_type == "long" and close >= take_profit) or (position_type == "short" and close <= take_profit)
+        signal_state := "Take Profit"
+        position_active := false
+        position_type := ""
+        
+    // Stop loss management
+    else if sl_management != "Aggressive"
+        profit_pct = position_type == "long" ? (close - entry_price) / (take_profit - entry_price) : (entry_price - close) / (entry_price - take_profit)
+        
+        if profit_pct >= 0.7
+            if sl_management == "Neutral"
+                new_sl = entry_price
+                stop_loss := new_sl
+            else if sl_management == "Conservative"
+                breakeven_sl = entry_price
+                stop_loss := breakeven_sl
+
+// ==================== VISUAL DISPLAY ====================
+// Current Volume Profile
+current_vp = calculate_flexible_volume_profile(0, math.min(50, bar_index))
+
+if show_volume_profile and barstate.islast and not na(current_vp.poc_price)
+    // POC Line
+    poc_line = line.new(bar_index - 20, current_vp.poc_price, bar_index + 10, current_vp.poc_price, 
+                       color=poc_color, width=3, extend=extend.right)
+    label.new(bar_index + 2, current_vp.poc_price, "POC: " + str.tostring(current_vp.poc_price, "#.##"), 
+              style=label.style_label_left, color=poc_color, textcolor=color.white, size=size.small)
+    
+    // Value Area
+    if not na(current_vp.vah_price) and not na(current_vp.val_price)
+        va_box = box.new(bar_index - 15, current_vp.vah_price, bar_index + 5, current_vp.val_price, value_area_color, na)
+        
+        vah_line = line.new(bar_index - 20, current_vp.vah_price, bar_index + 10, current_vp.vah_price, 
+                           color=color.blue, width=1, style=line.style_dashed, extend=extend.right)
+        val_line = line.new(bar_index - 20, current_vp.val_price, bar_index + 10, current_vp.val_price, 
+                           color=color.blue, width=1, style=line.style_dashed, extend=extend.right)
+
+// Trade Setup Display
+if show_trade_setups and highest_score > 0.3 and not na(best_setup.entry_price)
+    setup_color = best_setup.direction == "long" ? color.new(color.green, 80) : color.new(color.red, 80)
+    
+    // Entry line
+    entry_line = line.new(bar_index - 5, best_setup.entry_price, bar_index + 15, best_setup.entry_price, 
+                         color=color.blue, width=2, extend=extend.right)
+    
+    // SL and TP lines
+    if not na(best_setup.stop_loss)
+        sl_line = line.new(bar_index - 5, best_setup.stop_loss, bar_index + 15, best_setup.stop_loss, 
+                          color=color.red, width=1, style=line.style_dashed, extend=extend.right)
+    
+    if not na(best_setup.take_profit)
+        tp_line = line.new(bar_index - 5, best_setup.take_profit, bar_index + 15, best_setup.take_profit, 
+                          color=color.green, width=1, style=line.style_dashed, extend=extend.right)
+    
+    // Setup label
+    confirmations_text = ""
+    if array.size(best_setup.confirmations) > 0
+        for j = 0 to array.size(best_setup.confirmations) - 1
+            confirmations_text += array.get(best_setup.confirmations, j) + " | "
+    
+    label_text = best_setup.setup_type + " " + str.upper(best_setup.direction) + " | " + 
+                 "Score: " + str.tostring(best_setup.strength_score, "#.##") + " | " + 
+                 "Entry: " + str.tostring(best_setup.entry_price, "#.##") + " | " + 
+                 confirmations_text
+    
+    label.new(bar_index + 8, best_setup.entry_price, label_text, 
+              style=label.style_label_left, color=setup_color, textcolor=color.white, size=size.normal)
+
+// ==================== INFORMATION TABLE ====================
+if barstate.islast
+    info_table = table.new(position.top_right, 3, 12, bgcolor=color.new(color.white, 10), border_width=1)
+    
+    // Headers
+    table.cell(info_table, 0, 0, "Component", text_color=color.black, bgcolor=color.gray)
+    table.cell(info_table, 1, 0, "Value", text_color=color.black, bgcolor=color.gray)
+    table.cell(info_table, 2, 0, "Status", text_color=color.black, bgcolor=color.gray)
+    
+    // Market Context
+    table.cell(info_table, 0, 1, "Market Phase", text_color=color.black)
+    table.cell(info_table, 1, 1, current_context.market_phase, text_color=color.black)
+    table.cell(info_table, 2, 1, current_context.in_strong_trend ? "Strong" : "Weak", text_color=color.black)
+    
+    // Signal
+    table.cell(info_table, 0, 2, "Signal", text_color=color.black)
+    table.cell(info_table, 1, 2, signal_state, text_color=color.black)
+    signal_color = signal_state == "Buy" ? color.green : signal_state == "Sell" ? color.red : color.gray
+    table.cell(info_table, 2, 2, position_active ? "ACTIVE" : "WAIT", text_color=color.white, bgcolor=signal_color)
+    
+    // Volume Profile Data
+    table.cell(info_table, 0, 3, "POC", text_color=color.black)
+    poc_str = not na(current_vp.poc_price) ? str.tostring(current_vp.poc_price, "#.##") : "N/A"
+    table.cell(info_table, 1, 3, poc_str, text_color=color.black)
+    
+    table.cell(info_table, 0, 4, "VAH", text_color=color.black)
+    vah_str = not na(current_vp.vah_price) ? str.tostring(current_vp.vah_price, "#.##") : "N/A"
+    table.cell(info_table, 1, 4, vah_str, text_color=color.black)
+    
+    table.cell(info_table, 0, 5, "VAL", text_color=color.black)
+    val_str = not na(current_vp.val_price) ? str.tostring(current_vp.val_price, "#.##") : "N/A"
+    table.cell(info_table, 1, 5, val_str, text_color=color.black)
+    
+    // Best Setup Info
+    table.cell(info_table, 0, 6, "Best Setup", text_color=color.black)
+    setup_type_str = highest_score > 0.3 ? best_setup.setup_type : "None"
+    table.cell(info_table, 1, 6, setup_type_str, text_color=color.black)
+    
+    table.cell(info_table, 0, 7, "Setup Score", text_color=color.black)
+    score_str = highest_score > 0.3 ? str.tostring(highest_score, "#.##") : "N/A"
+    table.cell(info_table, 1, 7, score_str, text_color=color.black)
+    
+    table.cell(info_table, 0, 8, "Confirmations", text_color=color.black)
+    conf_count = highest_score > 0.3 ? str.tostring(array.size(best_setup.confirmations)) : "0"
+    table.cell(info_table, 1, 8, conf_count, text_color=color.black)
+    
+    // Position Info
+    if position_active
+        table.cell(info_table, 0, 9, "Entry", text_color=color.black)
+        table.cell(info_table, 1, 9, str.tostring(entry_price, "#.##"), text_color=color.black)
+        
+        table.cell(info_table, 0, 10, "Stop Loss", text_color=color.black)
+        table.cell(info_table, 1, 10, str.tostring(stop_loss, "#.##"), text_color=color.black)
+        
+        table.cell(info_table, 0, 11, "Take Profit", text_color=color.black)
+        table.cell(info_table, 1, 11, str.tostring(take_profit, "#.##"), text_color=color.black)
+    else
+        table.cell(info_table, 0, 9, "Trend Strength", text_color=color.black)
+        table.cell(info_table, 1, 9, str.tostring(current_context.trend_strength, "#.##"), text_color=color.black)
+        
+        table.cell(info_table, 0, 10, "ATR", text_color=color.black)
+        table.cell(info_table, 1, 10, str.tostring(atr14, "#.##"), text_color=color.black)
+        
+        table.cell(info_table, 0, 11, "Min Confirms", text_color=color.black)
+        table.cell(info_table, 1, 11, str.tostring(min_confirmations), text_color=color.black)
+
+// ==================== ALERTS ====================
+long_entry = signal_state == "Buy" and signal_state[1] != "Buy"
+short_entry = signal_state == "Sell" and signal_state[1] != "Sell"
+sl_hit = signal_state == "Stop Loss" and signal_state[1] != "Stop Loss"
+tp_hit = signal_state == "Take Profit" and signal_state[1] != "Take Profit"
+
+alertcondition(long_entry, title="VP Enhanced Long", message="🟢 VOLUME PROFILE LONG SIGNAL - Enhanced Dale Method")
+alertcondition(short_entry, title="VP Enhanced Short", message="🔴 VOLUME PROFILE SHORT SIGNAL - Enhanced Dale Method")
+alertcondition(sl_hit, title="VP Stop Loss", message="⛔ VOLUME PROFILE STOP LOSS - Position Closed")
+alertcondition(tp_hit, title="VP Take Profit", message="✅ VOLUME PROFILE TAKE PROFIT - Trade Successful")
+
+// Debug Plots
+plot(current_vp.poc_price, title="POC", color=color.red, linewidth=2, display=display.none)
+plot(highest_score, title="Best Setup Score", color=color.blue, display=display.none)
